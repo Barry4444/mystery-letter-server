@@ -7,30 +7,33 @@ import { Server } from 'socket.io';
 
 const app = express();
 
-/* ---------------------- Config ---------------------- */
-const PORT = process.env.PORT || 3001;
-const SOCKET_PATH = process.env.SOCKET_PATH || '/socket.io';
-
-// Optionele allowlist (CSV) en/of regex voor origins (Netlify, localhost, enz.)
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// Voor bijv. Netlify deploy previews kun je een regex gebruiken:
-// ALLOWED_ORIGINS_REGEX="^https:\\/\\/.*--mystery-letter-client\\.netlify\\.app$"
-const ALLOWED_ORIGINS_REGEX = process.env.ALLOWED_ORIGINS_REGEX
+/* =========================
+   CORS / ORIGIN-ALLOWLIST
+   ========================= */
+// Voorbeeld (Render → Environment):
+// ALLOWED_ORIGINS=https://mystery-letter.netlify.app
+// ALLOWED_ORIGINS_REGEX=^https:\/\/.*--mystery-letter.*\.netlify\.app$
+const RAW_ORIGINS = process.env.ALLOWED_ORIGINS || '';
+const ALLOWED_ORIGINS = RAW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+const ORIGINS_REGEX = process.env.ALLOWED_ORIGINS_REGEX
   ? new RegExp(process.env.ALLOWED_ORIGINS_REGEX)
   : null;
 
+// Als je niets geconfigureerd hebt, laten we ALLES toe (handig tijdens debug).
+// Zet ALLOWED_ORIGINS/REGEX zodra het werkt.
+const allowAll = ALLOWED_ORIGINS.length === 0 && !ORIGINS_REGEX;
+
 const isAllowedOrigin = (origin) => {
-  if (!origin) return true; // server-to-server/curl
+  // server-naar-server / curl request (zonder Origin) mag
+  if (!origin) return true;
+  if (allowAll) return true;
   if (ALLOWED_ORIGINS.includes(origin)) return true;
-  if (ALLOWED_ORIGINS_REGEX?.test(origin)) return true;
+  if (ORIGINS_REGEX?.test(origin)) return true;
+  console.warn('[CORS BLOCKED]', origin);
   return false;
 };
 
-/* -------------------- Middleware -------------------- */
+// Express CORS (voor HTTP/polling)
 app.use(cors({
   origin(origin, cb) {
     if (isAllowedOrigin(origin)) return cb(null, true);
@@ -38,43 +41,72 @@ app.use(cors({
   },
   credentials: true,
 }));
+
 app.use(express.json());
 
-/* ---------------- Health & Root --------------------- */
-app.get('/health', (req, res) => res.status(200).send('OK'));
-app.get('/', (req, res) => res.status(200).send('Mystery Letter server is running'));
+// Eenvoudige healthcheck
+app.get('/health', (_req, res) => res.type('text').send('OK'));
 
-/* ------------------ HTTP + SIO ---------------------- */
+/* =========================
+   HTTP + Socket.IO
+   ========================= */
 const httpServer = createServer(app);
 
 const io = new Server(httpServer, {
-  path: SOCKET_PATH,
+  path: '/socket.io',
   cors: {
     origin(origin, cb) {
       if (isAllowedOrigin(origin)) return cb(null, true);
       cb(new Error('Not allowed by CORS'));
     },
     credentials: true,
-    methods: ['GET', 'POST'],
   },
-  // transports laat je standaard staan; Socket.IO schakelt zelf over naar wss
-  // indien de client via HTTPS draait.
+  // Iets ruimer timen achter proxies
+  pingTimeout: 25_000,
+  pingInterval: 25_000,
 });
 
+// Handige logs in Render -> Logs (helpt bij CORS/upgrade debugging)
+io.engine.on('initial_headers', (_headers, req) => {
+  console.log('[SIO handshake] origin:', req.headers.origin, 'url:', req.url);
+});
+io.engine.on('headers', (_headers, req) => {
+  console.log('[SIO upgrade] origin:', req.headers.origin);
+});
+io.engine.on('connection_error', (err) => {
+  console.warn('[SIO connection_error]', err?.code, err?.message);
+});
+
+// === Socket handlers (voeg je eigen events hier toe) ===
 io.on('connection', (socket) => {
-  console.log('client connected', socket.id, 'origin:', socket.handshake.headers.origin);
+  console.log('client connected:', socket.id, 'origin:', socket.request.headers.origin);
 
   socket.on('ping', () => socket.emit('pong'));
+  // Voorbeeld:
+  // socket.on('joinRoom', (roomId) => {
+  //   socket.join(roomId);
+  //   socket.to(roomId).emit('joined', socket.id);
+  // });
 
   socket.on('disconnect', (reason) => {
-    console.log('client disconnected', socket.id, reason);
+    console.log('client disconnected:', socket.id, 'reason:', reason);
   });
 });
 
-/* Belangrijk op Render: bind aan 0.0.0.0 zodat externe connecties werken */
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server luistert op poort ${PORT}`);
-  console.log('Socket path:', SOCKET_PATH);
-  console.log('Allowed origins (list):', ALLOWED_ORIGINS);
-  if (ALLOWED_ORIGINS_REGEX) console.log('Allowed origins (regex):', ALLOWED_ORIGINS_REGEX);
+/* =========================
+   START SERVER
+   ========================= */
+const PORT = process.env.PORT || 10000;
+httpServer.listen(PORT, () => {
+  console.log('Server luistert op poort', PORT);
+  console.log('Allowed origins:', ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : '(none, fallback allow-all ON)');
+  if (ORIGINS_REGEX) console.log('Allowed regex:', ORIGINS_REGEX);
+});
+
+// Netjes afsluiten op Render
+process.on('SIGTERM', () => {
+  console.log('SIGTERM ontvangen – sluit HTTP en Socket.IO…');
+  io.close(() => {
+    httpServer.close(() => process.exit(0));
+  });
 });
