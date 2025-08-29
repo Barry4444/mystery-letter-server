@@ -1,54 +1,73 @@
+// index.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 
-const PORT = process.env.PORT || 3001;
+const app = express();
 
-/**
- * Allowed origins:
- * - zet in Render env var ALLOWED_ORIGINS als CSV (bv. https://mystery-letter.netlify.app,https://mysteryletter.onrender.com)
- * - laat leeg tijdens lokale dev
- */
+// --- Config ---
+const PORT = process.env.PORT || 3001;
+const SOCKET_PATH = process.env.SOCKET_PATH || '/socket.io';
+
+// Optionele allowlist (CSV) en/of regex voor origins (Netlify, preview URL's, …)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-const originForCors =
-  ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : '*'; // voor dev ok; in prod liever expliciet zetten
+const ALLOWED_ORIGINS_REGEX = process.env.ALLOWED_ORIGINS_REGEX
+  ? new RegExp(process.env.ALLOWED_ORIGINS_REGEX)
+  : null;
 
-const app = express();
-app.use(cors({ origin: originForCors, methods: ['GET', 'POST'] }));
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true; // server-to-server/curl
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+  if (ALLOWED_ORIGINS_REGEX?.test(origin)) return true;
+  return false;
+};
+
+// --- Middleware ---
+app.use(cors({
+  origin(origin, cb) {
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
-// Health + info
-app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'mystery-letter-server', time: new Date().toISOString() });
-});
-app.get('/healthz', (_req, res) => res.sendStatus(204));
+// --- Health & root routes ---
+app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.status(200).send('Mystery Letter server is running'));
 
+// --- HTTP + Socket.IO ---
 const httpServer = createServer(app);
-
 const io = new Server(httpServer, {
-  // Cruciaal voor HTTPS-only: ga direct naar WebSocket (geen polling)
-  transports: ['websocket'],
-  cors: { origin: originForCors, methods: ['GET', 'POST'] },
-  path: '/socket.io'
+  path: SOCKET_PATH,
+  cors: {
+    origin(origin, cb) {
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      cb(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+    methods: ['GET', 'POST'],
+  },
 });
 
-// --- Very basic socket events (pas aan naar je behoefte) ---
 io.on('connection', (socket) => {
-  console.log('client connected:', socket.id);
-
+  console.log('client connected', socket.id);
   socket.on('ping', () => socket.emit('pong'));
-
   socket.on('disconnect', (reason) => {
-    console.log('client disconnected:', socket.id, reason);
+    console.log('client disconnected', socket.id, reason);
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+// Belangrijk: bind op 0.0.0.0 zodat Render extern kan verbinden
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server luistert op poort ${PORT}`);
+  console.log('Socket path:', SOCKET_PATH);
+  console.log('Allowed origins (list):', ALLOWED_ORIGINS);
+  if (ALLOWED_ORIGINS_REGEX) console.log('Allowed origins (regex):', ALLOWED_ORIGINS_REGEX);
 });
