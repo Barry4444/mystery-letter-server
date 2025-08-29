@@ -1,127 +1,76 @@
-// index.js (ESM)
-// ------------------------------
-import * as dotenv from 'dotenv';
-dotenv.config();
-
+// index.js
+import 'dotenv/config';
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server } from 'socket.io';
 
-// ======= Config =======
-const PORT = process.env.PORT || 10000;
+const app = express();
 
-// Voeg hier je Netlify URL(s) toe, komma-gescheiden, bv:
-// CLIENT_ORIGIN="https://mystery-letter-game.netlify.app,http://localhost:5173"
-const FROM_ENV = (process.env.CLIENT_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// Fallbacks die meestal handig zijn tijdens dev
-const DEFAULT_ALLOW = [
-  /^https?:\/\/localhost(?::\d+)?$/,
-  /^https?:\/\/127\.0\.0\.1(?::\d+)?$/,
-  /\.netlify\.app$/i,
+/* (4) CORS: zet hier ALLE toegestane origins */
+const allowedOrigins = [
+  'https://mystery-letter-game.netlify.app', // jouw Netlify client
+  'http://localhost:5173',                   // lokaal Vite dev
+  // voeg hier extra domeinen toe als je die gebruikt
 ];
 
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // health checks / server-to-server
-  if (FROM_ENV.includes(origin)) return true;
-  if (DEFAULT_ALLOW.some(re => re.test(origin))) return true;
-  return false;
-}
-
-// ======= Express app =======
-const app = express();
-app.set('trust proxy', 1);
-
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (isAllowedOrigin(origin)) return cb(null, true);
-      return cb(new Error('CORS blocked'), false);
-    },
-    credentials: true,
-  })
-);
-
+app.use(cors({ origin: allowedOrigins, credentials: true }));
 app.use(express.json());
 
-// Health & info endpoints (Render kijkt graag mee)
-app.get('/', (_req, res) => res.status(200).send('OK'));
-app.get('/healthz', (_req, res) => res.status(200).json({ ok: true, at: Date.now() }));
-app.get('/ping', (_req, res) => res.json({ pong: true, at: Date.now() }));
+/* simpele health endpoints voor Render */
+app.get('/', (_req, res) => res.type('text').send('OK'));
+app.get('/health', (_req, res) => res.json({ ok: true, at: Date.now() }));
 
-// ======= HTTP server + Socket.IO =======
 const server = http.createServer(app);
 
+/* Socket.IO server met hetzelfde path als de client gebruikt */
 const io = new Server(server, {
-  path: '/socket.io', // moet matchen met de client
-  transports: ['websocket', 'polling'], // polling fallback kan handig zijn
-  allowEIO3: false,
+  path: '/socket.io',
+  transports: ['websocket', 'polling'],
   cors: {
-    origin: (origin, cb) => cb(null, isAllowedOrigin(origin) ? true : false),
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true,
   },
 });
 
-io.on('connection', (sock) => {
-  const ip = sock.handshake.headers['x-forwarded-for'] || sock.handshake.address;
-  const origin = sock.handshake.headers.origin;
-  console.log(`[conn] ${sock.id} from ${ip} (origin: ${origin})`);
+/* (3) EVENT-HANDLERS: binnen io.on('connection', ...) */
+io.on('connection', (socket) => {
+  console.log('client connected', socket.id);
 
-  // Log alle inkomende events
-  sock.onAny((event, ...args) => {
-    console.log('[in]', event, ...args);
+  // ping; client verwacht een ACK
+  socket.on('ping:server', (_data, ack) => {
+    ack?.({ ok: true, at: Date.now(), you: socket.id });
   });
 
-  // Eenvoudige ping -> ack
-  sock.on('ping:server', (payload, ack) => {
-    console.log('[ping:server]', payload);
-    ack?.({ ok: true, now: Date.now() }); // BELANGRIJK: ack terugsturen
-  });
-
-  // Join handler die meerdere eventnamen accepteert
-  const handleJoin = (payload = {}, ack) => {
+  // join; client doet s.timeout(...).emit('join', {...}, ack)
+  socket.on('join', ({ roomId, name } = {}, ack) => {
     try {
-      const { roomId, name } = payload;
-      if (!roomId || !name) {
-        return ack?.({ ok: false, error: 'missing roomId/name' });
-      }
-
-      sock.join(roomId);
-      console.log(`[join] ${sock.id} -> ${roomId} (${name})`);
-
-      // Ack naar de aanvrager
-      ack?.({ ok: true, roomId, id: sock.id });
-
-      // Broadcast naar de room
-      sock.to(roomId).emit('user:joined', { id: sock.id, name });
-    } catch (e) {
-      ack?.({ ok: false, error: e.message });
+      if (!roomId) return ack?.({ ok: false, error: 'roomId required' });
+      socket.join(roomId);
+      socket.data.name = name || `User-${socket.id.slice(0, 4)}`;
+      // Broadcast naar de room dat iemand binnen is
+      socket.to(roomId).emit('room:user-joined', {
+        id: socket.id,
+        name: socket.data.name,
+      });
+      ack?.({ ok: true, roomId, id: socket.id });
+    } catch (err) {
+      ack?.({ ok: false, error: err.message || 'join failed' });
     }
-  };
-
-  sock.on('join', handleJoin);
-  sock.on('joinRoom', handleJoin);
-  sock.on('room:join', handleJoin);
-
-  // Optioneel: een simpel message-event
-  sock.on('room:message', ({ roomId, text }, ack) => {
-    if (!roomId || !text) return ack?.({ ok: false, error: 'missing roomId/text' });
-    sock.to(roomId).emit('room:message', { id: sock.id, text, at: Date.now() });
-    ack?.({ ok: true });
   });
 
-  sock.on('disconnect', (reason) => {
-    console.log(`[disc] ${sock.id} – ${reason}`);
+  socket.on('disconnect', (reason) => {
+    // Optioneel: laat de room(s) weten dat iemand weg is
+    const rooms = [...socket.rooms].filter((r) => r !== socket.id);
+    rooms.forEach((r) =>
+      io.to(r).emit('room:user-left', { id: socket.id, reason })
+    );
+    console.log('disconnect', socket.id, reason);
   });
 });
 
-// ======= Start =======
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`Server luistert op poort ${PORT}`);
-  console.log('Toegestane origins:', FROM_ENV.length ? FROM_ENV : '(defaults incl. *.netlify.app & localhost)');
 });
