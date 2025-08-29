@@ -7,16 +7,18 @@ import { Server } from 'socket.io';
 
 const app = express();
 
-// --- Config ---
+/* ---------------------- Config ---------------------- */
 const PORT = process.env.PORT || 3001;
 const SOCKET_PATH = process.env.SOCKET_PATH || '/socket.io';
 
-// Optionele allowlist (CSV) en/of regex voor origins (Netlify, preview URL's, …)
+// Optionele allowlist (CSV) en/of regex voor origins (Netlify, localhost, enz.)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
+// Voor bijv. Netlify deploy previews kun je een regex gebruiken:
+// ALLOWED_ORIGINS_REGEX="^https:\\/\\/.*--mystery-letter-client\\.netlify\\.app$"
 const ALLOWED_ORIGINS_REGEX = process.env.ALLOWED_ORIGINS_REGEX
   ? new RegExp(process.env.ALLOWED_ORIGINS_REGEX)
   : null;
@@ -28,7 +30,7 @@ const isAllowedOrigin = (origin) => {
   return false;
 };
 
-// --- Middleware ---
+/* -------------------- Middleware -------------------- */
 app.use(cors({
   origin(origin, cb) {
     if (isAllowedOrigin(origin)) return cb(null, true);
@@ -38,12 +40,13 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// --- Health & root routes ---
+/* ---------------- Health & Root --------------------- */
 app.get('/health', (req, res) => res.status(200).send('OK'));
 app.get('/', (req, res) => res.status(200).send('Mystery Letter server is running'));
 
-// --- HTTP + Socket.IO ---
+/* ------------------ HTTP + SIO ---------------------- */
 const httpServer = createServer(app);
+
 const io = new Server(httpServer, {
   path: SOCKET_PATH,
   cors: {
@@ -54,17 +57,21 @@ const io = new Server(httpServer, {
     credentials: true,
     methods: ['GET', 'POST'],
   },
+  // transports laat je standaard staan; Socket.IO schakelt zelf over naar wss
+  // indien de client via HTTPS draait.
 });
 
 io.on('connection', (socket) => {
-  console.log('client connected', socket.id);
+  console.log('client connected', socket.id, 'origin:', socket.handshake.headers.origin);
+
   socket.on('ping', () => socket.emit('pong'));
+
   socket.on('disconnect', (reason) => {
     console.log('client disconnected', socket.id, reason);
   });
 });
 
-// Belangrijk: bind op 0.0.0.0 zodat Render extern kan verbinden
+/* Belangrijk op Render: bind aan 0.0.0.0 zodat externe connecties werken */
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`Server luistert op poort ${PORT}`);
   console.log('Socket path:', SOCKET_PATH);
