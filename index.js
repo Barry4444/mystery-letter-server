@@ -1,191 +1,199 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { socket } from './socket';
-import './app.css'; // zwarte achtergrond etc.
+// index.js (SERVER)
+import express from 'express';
+import http from 'http';
+import cors from 'cors';
+import { Server } from 'socket.io';
 
-const cardImg = (key) => `/cards/${key}.png`;
+const app = express();
+app.use(cors());
+app.get('/', (_req, res) => res.send('mystery-letter-server OK'));
 
-export default function App() {
-  // join
-  const [roomId, setRoomId] = useState('kamer1');
-  const [name, setName] = useState('');
-  const [status, setStatus] = useState('');
+const server = http.createServer(app);
+const io = new Server(server, {
+  path: '/socket.io',
+  cors: {
+    origin: '*', // of beperk tot je Netlify domein
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
 
-  // state uit server
-  const [state, setState] = useState(null);      // room:state
-  const [myHand, setMyHand] = useState([]);      // player:hand
-  const youId = socket.id;
-  useEffect(() => {
-    const onConnect = () => { /* noop */ };
-    const onState = (s) => setState(s);
-    const onHand = ({ hand }) => setMyHand(hand ?? []);
-    socket.on('connect', onConnect);
-    socket.on('room:state', onState);
-    socket.on('player:hand', onHand);
-    return () => {
-      socket.off('connect', onConnect);
-      socket.off('room:state', onState);
-      socket.off('player:hand', onHand);
-    };
-  }, []);
+const PORT = process.env.PORT || 10000;
 
-  const you = useMemo(() => {
-    if (!state) return null;
-    return state.players?.find(p => p.id === youId) || null;
-  }, [state, youId]);
+// ---- simpele gamestate ----
+const rooms = new Map();
 
-  const isHost = state?.hostId === youId;
-  const isYourTurn = state?.turn === youId;
-
-  // bots configuratie (client-side controls)
-  const [botsCount, setBotsCount] = useState(0);
-  const [botLevel, setBotLevel] = useState(1);
-
-  // -------- actions --------
-  const doJoin = () => {
-    setStatus('Bezig met join…');
-    socket.timeout(8000).emit('join', { roomId, name }, (res) => {
-      if (!res?.ok) return setStatus(`Join mislukt: ${res?.error ?? 'geen ack'}`);
-      setStatus(`Gejoined als ${name} — room ${roomId}`);
-    });
+function makeRoom(roomId) {
+  return {
+    roomId,
+    hostId: null,
+    players: new Map(),
+    order: [],
+    started: false,
+    round: 0,
+    turn: null,
+    deck: [],
+    discard: [],
+    settings: { music: false, botsCount: 0, botLevel: 1 },
+    logs: [],
   };
-
-  const claimHost = () => {
-    socket.timeout(5000).emit('host:claim', {}, (res) => {
-      if (!res?.ok) setStatus(`Host claim faalde: ${res?.error}`);
-    });
-  };
-
-  const toggleMusic = () => {
-    socket.timeout(5000).emit('music:toggle', {}, (res) => {
-      if (!res?.ok) setStatus(`Muziek toggle faalde: ${res?.error}`);
-    });
-  };
-
-  const applyBots = () => {
-    socket.timeout(5000).emit('bots:configure', { botsCount, botLevel }, (res) => {
-      if (!res?.ok) setStatus(`Bots instellen faalde: ${res?.error}`);
-    });
-  };
-
-  const newGame = () => {
-    socket.timeout(5000).emit('game:new', {}, (res) => {
-      if (!res?.ok) setStatus(`Nieuw spel faalde: ${res?.error}`);
-    });
-  };
-
-  const startRound = () => {
-    socket.timeout(5000).emit('game:startRound', {}, (res) => {
-      if (!res?.ok) setStatus(`Start ronde faalde: ${res?.error}`);
-    });
-  };
-
-  const drawCard = () => {
-    socket.timeout(5000).emit('game:draw', {}, (res) => {
-      if (!res?.ok) setStatus(`Trek kaart faalde: ${res?.error}`);
-    });
-  };
-
-  // -------- UI --------
-  return (
-    <div className="app-wrap">
-      <div className="panel">
-        <h1>Mystery Letter</h1>
-
-        {/* Join */}
-        <div className="row">
-          <input className="inp" placeholder="Room ID"
-                 value={roomId} onChange={e=>setRoomId(e.target.value)} />
-          <input className="inp" placeholder="Naam"
-                 value={name} onChange={e=>setName(e.target.value)} />
-          <button className="btn" onClick={doJoin}>Join</button>
-        </div>
-
-        {/* Host */}
-        <div className="row">
-          <label className="host-label">
-            Host: {state?.hostId ? (state.hostId === youId ? 'jij' : 'bezet') : 'niemand'}
-          </label>
-          <button className="btn" disabled={!!state?.hostId && !isHost} onClick={claimHost}>
-            Claim host
-          </button>
-        </div>
-
-        {/* Host controls */}
-        {isHost && (
-          <div className="host-controls">
-            <div className="row">
-              <button className="btn" onClick={toggleMusic}>
-                Muziek {state?.settings?.music ? 'uit' : 'aan'}
-              </button>
-              <button className="btn" onClick={newGame}>Nieuw spel</button>
-              <button className="btn" onClick={startRound}>Start ronde</button>
-            </div>
-
-            <div className="row">
-              <div className="slider">
-                <label># Bots: {botsCount}</label>
-                <input type="range" min="0" max="3" value={botsCount}
-                  onChange={e=>setBotsCount(parseInt(e.target.value))} />
-              </div>
-              <div className="slider">
-                <label>Bot-niveau: {botLevel}</label>
-                <input type="range" min="1" max="3" value={botLevel}
-                  onChange={e=>setBotLevel(parseInt(e.target.value))} />
-              </div>
-              <button className="btn" onClick={applyBots}>Toepassen</button>
-            </div>
-          </div>
-        )}
-
-        {/* Spel status */}
-        <div className="row">
-          <span>Ronde: {state?.round ?? 0}</span>
-          <span> | Beurt: {state?.turn ? (state.players?.find(p=>p.id===state.turn)?.name ?? '—') : '—'}</span>
-        </div>
-
-        {/* Acties speler */}
-        <div className="row">
-          <button className="btn"
-                  disabled={!isYourTurn || (myHand?.length ?? 0) !== 1 || !state?.started}
-                  onClick={drawCard}>
-            Trek kaart
-          </button>
-          {/* (Later: knoppen om 1 van 2 kaarten te spelen) */}
-        </div>
-
-        {/* Jouw hand */}
-        <div className="hand">
-          {(myHand ?? []).map((c, i) => (
-            <div className="card" key={i} title={`${c.name} (${c.rank})`}>
-              <img src={cardImg(c.key)} alt={c.name} />
-              <div className="caption">{c.name}</div>
-            </div>
-          ))}
-          {(!myHand || myHand.length === 0) && <div className="placeholder">Nog geen kaarten</div>}
-        </div>
-
-        {/* Spelers */}
-        <div className="players">
-          {(state?.players ?? []).map(p => (
-            <div className={`pill ${p.id===youId?'you':''} ${p.alive?'':'dead'}`} key={p.id}>
-              <span>{p.name}{p.isBot?' 🤖':''}{p.id===state?.hostId?' ⭐':''}</span>
-            </div>
-          ))}
-        </div>
-
-        {/* Log (nieuwste boven) */}
-        <div className="log">
-          <div className="log-title">Logboek</div>
-          <div className="log-body">
-            {(state?.logs ?? []).map((line, idx) => (
-              <div className="log-line" key={idx}>{line}</div>
-            ))}
-          </div>
-        </div>
-
-        {/* Status/ fouten */}
-        <div className="status">{status}</div>
-      </div>
-    </div>
-  );
 }
+function log(room, msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  room.logs.unshift(line);
+  room.logs = room.logs.slice(0, 50);
+}
+const CARD_DEFS = [
+  { key: 'ziener',     name: 'Ziener',     rank: 1, count: 5 },
+  { key: 'wolf',       name: 'Wolf',       rank: 2, count: 2 },
+  { key: 'ridder',     name: 'Ridder',     rank: 3, count: 2 },
+  { key: 'zeemeermin', name: 'Zeemeermin', rank: 4, count: 2 },
+  { key: 'god',        name: 'God',        rank: 5, count: 1 },
+  { key: 'emir',       name: 'Emir',       rank: 6, count: 1 },
+  { key: 'heks',       name: 'Heks',       rank: 7, count: 2 },
+  { key: 'prinses',    name: 'Prinses',    rank: 8, count: 1 },
+];
+function buildDeck() {
+  const deck = [];
+  for (const def of CARD_DEFS) for (let i = 0; i < def.count; i++) deck.push({ key: def.key, name: def.name, rank: def.rank });
+  for (let i = deck.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [deck[i], deck[j]] = [deck[j], deck[i]]; }
+  return deck;
+}
+function roomOf(socket) {
+  const ids = [...socket.rooms].filter(r => r !== socket.id);
+  return rooms.get(ids[0]);
+}
+function publicPlayers(room) {
+  return [...room.players.values()].map(p => ({
+    id: p.id, name: p.name, isHost: !!p.isHost, isBot: !!p.isBot,
+    alive: p.alive !== false, protected: !!p.protected, coins: p.coins || 0,
+  }));
+}
+function broadcastState(room) {
+  io.to(room.roomId).emit('room:state', {
+    roomId: room.roomId, hostId: room.hostId, players: publicPlayers(room),
+    started: room.started, round: room.round, turn: room.turn,
+    settings: room.settings, logs: room.logs,
+  });
+  for (const [id, p] of room.players) {
+    if (p.isBot) continue;
+    io.to(id).emit('player:hand', { hand: p.hand || [] });
+  }
+}
+function ensureOrder(room) {
+  room.order = [...room.players.keys()].filter(id => room.players.get(id).alive !== false);
+  if (room.order.length && !room.turn) room.turn = room.order[0];
+}
+function nextTurn(room) {
+  if (!room.order.length) return;
+  const idx = room.order.indexOf(room.turn);
+  room.turn = room.order[(idx + 1) % room.order.length];
+}
+function botName(i){ return ['Bot A','Bot B','Bot C','Bot D'][i] || `Bot ${i+1}`; }
+
+io.on('connection', (socket) => {
+  socket.on('ping:server', (_p, ack) => ack?.({ ok: true, pong: Date.now() }));
+
+  socket.on('join', ({ roomId, name }, ack) => {
+    if (!roomId || !name) return ack?.({ ok:false, error:'roomId and name required' });
+    let room = rooms.get(roomId); if (!room){ room = makeRoom(roomId); rooms.set(roomId, room); }
+    socket.join(roomId);
+    room.players.set(socket.id, { id: socket.id, name, isHost:false, isBot:false, hand:[], alive:true, protected:false, coins:0 });
+    log(room, `${name} heeft de kamer betreden`);
+    ensureOrder(room); broadcastState(room);
+    ack?.({ ok:true, roomId, you:{ id: socket.id, name } });
+  });
+
+  socket.on('host:claim', (_p, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (room.hostId && room.hostId !== socket.id) return ack?.({ ok:false, error:'host already taken' });
+    room.hostId = socket.id; const me = room.players.get(socket.id); if (me) me.isHost = true;
+    log(room, `${me?.name ?? 'Host'} is host geworden`);
+    broadcastState(room); ack?.({ ok:true });
+  });
+
+  socket.on('bots:configure', ({ botsCount=0, botLevel=1 }, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+    for (const [id,p] of [...room.players]) if (p.isBot) room.players.delete(id);
+    for (let i=0;i<Math.max(0,Math.min(3,botsCount));i++){
+      const id = `bot-${i+1}`;
+      room.players.set(id,{ id, name:botName(i), isBot:true, botLevel:Math.max(1,Math.min(3,botLevel)), hand:[], alive:true, protected:false, coins:0 });
+    }
+    room.settings.botsCount = Math.max(0,Math.min(3,botsCount));
+    room.settings.botLevel = Math.max(1,Math.min(3,botLevel));
+    log(room, `Bots geconfigureerd: ${room.settings.botsCount} (lvl ${room.settings.botLevel})`);
+    ensureOrder(room); broadcastState(room); ack?.({ ok:true });
+  });
+
+  socket.on('music:toggle', (_p, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+    room.settings.music = !room.settings.music;
+    log(room, `Muziek ${room.settings.music ? 'aan' : 'uit'}`);
+    broadcastState(room); ack?.({ ok:true, music: room.settings.music });
+  });
+
+  socket.on('game:new', (_p, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+    room.started=false; room.round=0; room.turn=null; room.deck=[]; room.discard=[];
+    for (const p of room.players.values()){ p.hand=[]; p.alive=true; p.protected=false; }
+    log(room, 'Nieuw spel klaarzetten'); ensureOrder(room); broadcastState(room); ack?.({ ok:true });
+  });
+
+  socket.on('game:startRound', (_p, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+    const living = [...room.players.values()].filter(p => p.alive !== false);
+    if (living.length < 2) return ack?.({ ok:false, error:'min 2 spelers' });
+    room.round += 1; room.started = true; room.deck = buildDeck(); room.discard = [];
+    for (const p of living){ p.hand=[]; p.protected=false; }
+    for (const p of living){ const c = room.deck.pop(); if (c) p.hand.push(c); }
+    ensureOrder(room); log(room, `Ronde ${room.round} gestart`); broadcastState(room); ack?.({ ok:true });
+    maybeBotTurn(room);
+  });
+
+  socket.on('game:draw', (_p, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (room.turn !== socket.id) return ack?.({ ok:false, error:'not your turn' });
+    const me = room.players.get(socket.id); if (!me) return ack?.({ ok:false, error:'no player' });
+    if (!room.started) return ack?.({ ok:false, error:'round not started' });
+    if ((me.hand?.length ?? 0) !== 1) return ack?.({ ok:false, error:'need 1 card to draw' });
+    const card = room.deck.pop(); if (!card) return ack?.({ ok:false, error:'deck empty' });
+    me.hand.push(card); log(room, `${me.name} trekt een kaart`); broadcastState(room); ack?.({ ok:true, handSize: me.hand.length });
+  });
+
+  socket.on('disconnect', () => {
+    const room = roomOf(socket); if (!room) return;
+    const p = room.players.get(socket.id);
+    if (p) {
+      room.players.delete(socket.id);
+      log(room, `${p.name} heeft de kamer verlaten`);
+      if (room.hostId === socket.id) room.hostId = null;
+      ensureOrder(room);
+      if (!room.players.size) rooms.delete(room.roomId);
+      else broadcastState(room);
+    }
+  });
+});
+
+function maybeBotTurn(room) {
+  const actor = room.players.get(room.turn);
+  if (!actor || !actor.isBot) return;
+  setTimeout(() => {
+    if ((actor.hand?.length ?? 0) === 1 && room.deck.length) {
+      actor.hand.push(room.deck.pop());
+      log(room, `${actor.name} trekt een kaart (bot)`);
+      const idx = Math.random() < 0.5 ? 0 : 1;
+      const played = actor.hand.splice(idx, 1)[0];
+      room.discard.push(played);
+      log(room, `${actor.name} speelt ${played.name}`);
+      nextTurn(room); broadcastState(room); maybeBotTurn(room);
+    }
+  }, 800);
+}
+
+server.listen(PORT, () => {
+  console.log(`Server luistert op poort ${PORT}`);
+});
