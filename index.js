@@ -465,26 +465,43 @@ io.on('connection', (socket) => {
     if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
     room.started=false; room.round=0; room.turn=null; room.turnSeq=0; room.deck=[]; room.discard=[];
     for (const p of room.players.values()){ p.hand=[]; p.alive=true; p.protected=false; }
-    emitAmbiance(room);
+    emitAmbince(room);
     log(room, 'Nieuw spel klaarzetten'); ensureOrder(room); broadcastState(room); ack?.({ ok:true });
   });
 
   socket.on('game:startRound', (_p, ack) => {
-    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
-    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
-    const living = alivePlayers(room);
-    if (living.length < 2) return ack?.({ ok:false, error:'min 2 spelers' });
-    room.round += 1; room.started = true; room.deck = buildDeck(); room.discard = []; room.turnSeq=0;
-    for (const p of living){ p.hand=[]; p.protected=false; }
-    for (const p of living){ const c = room.deck.pop(); if (c) p.hand.push(c); }
-    ensureOrder(room);
-    // start van eerste speler: bescherming valt af (voor het geval)
-    const tp = room.players.get(room.turn);
-    if (tp?.protected) { tp.protected = false; emitAmbiance(room); }
-    log(room, `Ronde ${room.round} gestart`);
-    broadcastState(room); ack?.({ ok:true });
-    maybeBotTurn(room);
-  });
+  const room = roomOf(socket);
+  if (!room) return ack?.({ ok:false, error:'no room' });
+  if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+
+  const living = [...room.players.values()].filter(p => p.alive !== false);
+  if (living.length < 2) return ack?.({ ok:false, error:'min 2 spelers' });
+
+  // reset ronde
+  room.round += 1;
+  room.started = true;
+  room.deck = buildDeck();
+  room.discard = [];
+
+  // hand/protectie resetten en 1 kaart delen
+  for (const p of living) { p.hand = []; p.protected = false; }
+  for (const p of living) {
+    const c = room.deck.pop();
+    if (c) p.hand.push(c);
+  }
+
+  // BEURT HIER EXPLICIET ZETTEN
+  room.order = living.map(p => p.id);          // volgorde (eenvoudig: join-volgorde)
+  room.turn  = room.order[0];                  // eerste speler aan de beurt
+
+  const starter = room.players.get(room.turn)?.name || '—';
+  log(room, `Ronde ${room.round} gestart – ${starter} begint`);
+  broadcastState(room);
+  ack?.({ ok:true });
+
+  // laat een bot meteen spelen indien die start
+  maybeBotTurn(room);
+});
 
   socket.on('game:draw', (_p, ack) => {
     const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
