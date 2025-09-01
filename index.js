@@ -346,27 +346,36 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game:startRound', (_p, ack) => {
-    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
-    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+  const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+  if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
 
-    const living = livingPlayers(room);
-    if (living.length < 2) return ack?.({ ok:false, error:'min 2 spelers' });
+  // ✔️ Solo-test: als er maar 1 mens is en geen bots, voeg 1 bot toe
+  const current = [...room.players.values()].filter(p => p.alive !== false);
+  if (current.length < 2) {
+    const id = 'bot-1';
+    if (!room.players.has(id)) {
+      room.players.set(id, { id, name: 'Bot A', isBot: true, botLevel: 1, hand: [], alive: true, protected: false, coins: 0 });
+    }
+  }
 
-    room.round += 1;
-    room.started = true;
-    room.deck = buildDeck();
-    room.discard = [];
-    for (const p of living) { p.hand=[]; p.protected=false; }
-    for (const p of living) { const c = room.deck.pop(); if (c) p.hand.push(c); }
-    ensureOrder(room);
-    const turnP = room.players.get(room.turn);
-    if (turnP) turnP.protected = false;
+  // Bouw en deel uit
+  const living = [...room.players.values()].filter(p => p.alive !== false);
+  room.round += 1;
+  room.started = true;
+  room.deck = buildDeck();
+  room.discard = [];
+  for (const p of living) { p.hand = []; p.protected = false; }
+  for (const p of living) { const c = room.deck.pop(); if (c) p.hand.push(c); }
 
-    log(room, `Ronde ${room.round} gestart`);
-    broadcastState(room);
-    ack?.({ ok:true });
-    maybeBotTurn(room);
-  });
+  // Zorg dat de beurt zeker gezet is
+  ensureOrder(room);
+  if (!room.turn && room.order.length) room.turn = room.order[0];
+
+  log(room, `Ronde ${room.round} gestart (spelers: ${living.length})`);
+  broadcastState(room);
+  ack?.({ ok: true });
+  maybeBotTurn(room);
+});
 
   socket.on('game:draw', (_p, ack) => {
     const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
