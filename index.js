@@ -1,4 +1,4 @@
-// index.js — Mystery Letter server
+// index.js — Mystery Letter server (fixes: dedupe joins, stable host, working kick)
 import express from 'express';
 import http from 'http';
 import cors from 'cors';
@@ -11,11 +11,7 @@ app.get('/', (_req, res) => res.send('mystery-letter-server OK'));
 const server = http.createServer(app);
 const io = new Server(server, {
   path: '/socket.io',
-  cors: {
-    origin: '*', // eventueel beperken tot je Netlify domein
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
+  cors: { origin: '*', methods: ['GET','POST'], credentials: true },
 });
 
 const PORT = process.env.PORT || 10000;
@@ -43,101 +39,71 @@ function makeRoom(roomId) {
     order: [],
     started: false,
     round: 0,
-    turn: null,         // socketId van huidige beurt
+    turn: null,
     deck: [],
     discard: [],
     settings: { music: false, botsCount: 0, botLevel: 1 },
     logs: [],
   };
 }
-
 function log(room, msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
   room.logs.unshift(line);
   room.logs = room.logs.slice(0, 50);
 }
-
 function buildDeck() {
   const deck = [];
-  for (const def of CARD_DEFS) {
-    for (let i = 0; i < def.count; i++) {
-      deck.push({ key: def.key, name: def.name, rank: def.rank });
-    }
-  }
-  // shuffle
+  for (const def of CARD_DEFS) for (let i = 0; i < def.count; i++)
+    deck.push({ key: def.key, name: def.name, rank: def.rank });
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [deck[i], deck[j]] = [deck[j], deck[i]];
   }
   return deck;
 }
-
 function roomOf(socket) {
   const ids = [...socket.rooms].filter(r => r !== socket.id);
   return rooms.get(ids[0]);
 }
-
 function publicPlayers(room) {
   return [...room.players.values()].map(p => ({
-    id: p.id,
-    name: p.name,
-    isHost: !!p.isHost,
-    isBot: !!p.isBot,
-    alive: p.alive !== false,
-    protected: !!p.protected,
-    coins: p.coins || 0,
+    id: p.id, name: p.name, isHost: !!p.isHost, isBot: !!p.isBot,
+    alive: p.alive !== false, protected: !!p.protected, coins: p.coins || 0,
   }));
 }
-
 function broadcastState(room) {
   io.to(room.roomId).emit('room:state', {
-    roomId: room.roomId,
-    hostId: room.hostId,
-    players: publicPlayers(room),
-    started: room.started,
-    round: room.round,
-    turn: room.turn,
-    settings: room.settings,
-    logs: room.logs,
+    roomId: room.roomId, hostId: room.hostId, players: publicPlayers(room),
+    started: room.started, round: room.round, turn: room.turn,
+    settings: room.settings, logs: room.logs,
   });
   for (const [id, p] of room.players) {
     if (p.isBot) continue;
     io.to(id).emit('player:hand', { hand: p.hand || [] });
   }
 }
-
 function ensureOrder(room) {
-  room.order = [...room.players.keys()].filter(id => {
-    const p = room.players.get(id);
-    return p && p.alive !== false;
-  });
+  room.order = [...room.players.keys()].filter(id => room.players.get(id)?.alive !== false);
   if (room.order.length && !room.turn) room.turn = room.order[0];
 }
-
 function nextTurn(room) {
   if (!room.order.length) { room.turn = null; return; }
   const idx = room.order.indexOf(room.turn);
   const nextId = room.order[(idx + 1) % room.order.length];
   room.turn = nextId;
-
-  // bescherming loopt af aan het begin van je eigen beurt
   const nxt = room.players.get(nextId);
-  if (nxt) nxt.protected = false;
+  if (nxt) nxt.protected = false; // bescherming reset aan start eigen beurt
 }
-
 function livingPlayers(room) {
   return [...room.players.values()].filter(p => p.alive !== false);
 }
-
 function targetsAvailable(room, actorId) {
   return livingPlayers(room).filter(p => p.id !== actorId && !p.protected);
 }
-
 function removeFromOrder(room, pid) {
   room.order = room.order.filter(id => id !== pid);
   if (room.turn === pid) nextTurn(room);
 }
-
 function endRoundIfNeeded(room) {
   const alive = livingPlayers(room);
   if (alive.length <= 1) {
@@ -145,13 +111,8 @@ function endRoundIfNeeded(room) {
     if (winner) {
       winner.coins = (winner.coins || 0) + 1;
       log(room, `${winner.name} wint de ronde en krijgt een munt (totaal: ${winner.coins})`);
-      if (winner.coins >= 3) {
-        log(room, `${winner.name} wint het spel met 3 munten!`);
-        // reset alle munten voor nieuw spel (of laat staan; hier resetten we niet automatisch)
-      }
-    } else {
-      log(room, `Ronde eindigt zonder winnaar`);
-    }
+      if (winner.coins >= 3) log(room, `${winner.name} wint het spel met 3 munten!`);
+    } else log(room, `Ronde eindigt zonder winnaar`);
     room.started = false;
     room.turn = null;
     broadcastState(room);
@@ -159,14 +120,11 @@ function endRoundIfNeeded(room) {
   }
   return false;
 }
-
 function enforceForcedCombos(room, player) {
-  // Regel: Heks + Prinses in 1 hand => Prinses MOET worden afgelegd en speler verliest
-  if (!player || !player.hand || player.hand.length < 2) return false;
+  if (!player?.hand || player.hand.length < 2) return false;
   const hasHeks = player.hand.some(c => c.key === 'heks');
   const hasPrinses = player.hand.some(c => c.key === 'prinses');
   if (hasHeks && hasPrinses) {
-    // leg de prinses af => verlies
     const idx = player.hand.findIndex(c => c.key === 'prinses');
     const [prin] = player.hand.splice(idx, 1);
     room.discard.push(prin);
@@ -179,12 +137,10 @@ function enforceForcedCombos(room, player) {
 }
 
 /* --------------------------- Acties --------------------------- */
-
 function doZiener(room, actor, target, guess) {
-  if (!target) return; // geen doelwit ⇒ alleen afleggen
+  if (!target) return;
   const tCard = target.hand?.[0];
   if (tCard && tCard.key === guess) {
-    // target verliest
     target.alive = false;
     room.discard.push(tCard);
     target.hand = [];
@@ -194,32 +150,25 @@ function doZiener(room, actor, target, guess) {
     log(room, `${actor.name} raadde fout tegen ${target.name}`);
   }
 }
-
 function doWolf(room, actor, target) {
   if (!target) return;
   const tCard = target.hand?.[0] || null;
-  io.to(actor.id).emit('player:hand', { hand: actor.hand || [] }); // hand actor blijft
   io.to(actor.id).emit('private:peek', { targetId: target.id, card: tCard ? tCard.key : null });
   log(room, `${actor.name} kijkt (in stilte) naar de kaart van ${target.name}`);
 }
-
 function doRidder(room, actor, target) {
   const who = target || actor;
   who.protected = true;
   log(room, `${actor.name} geeft bescherming aan ${who.name}`);
-  // client gebruikt muziek-toggle als ambiance; hier enkel status
 }
-
 function doZeemeermin(room, actor, target) {
   if (!target) return;
-  const aCard = actor.hand?.[0];   // de overblijvende kaart van actor
+  const aCard = actor.hand?.[0];
   const tCard = target.hand?.[0];
   if (!aCard || !tCard) return;
   const loser = aCard.rank > tCard.rank ? target : actor;
   const winner = loser === actor ? target : actor;
-
   loser.alive = false;
-  // leg kaart van verliezer af (zijn enige kaart)
   if (loser.hand?.length) {
     room.discard.push(loser.hand[0]);
     loser.hand = [];
@@ -227,7 +176,6 @@ function doZeemeermin(room, actor, target) {
   log(room, `${winner.name} wint de vergelijking, ${loser.name} ligt eruit`);
   removeFromOrder(room, loser.id);
 }
-
 function doGod(room, actor, target) {
   if (!target) return;
   const a = actor.hand?.[0] ?? null;
@@ -236,7 +184,6 @@ function doGod(room, actor, target) {
   target.hand = a ? [a] : [];
   log(room, `${actor.name} wisselt kaart met ${target.name}`);
 }
-
 function doEmir(room, actor, target) {
   const who = target || actor;
   if (!room.deck.length || !who.hand?.length) {
@@ -249,28 +196,19 @@ function doEmir(room, actor, target) {
   room.discard.push(old);
   log(room, `${actor.name} geeft ${who === actor ? 'zichzelf' : who.name} een nieuwe kaart (oude afgelegd)`);
 }
-
 function playCard(room, player, cardIdx, targetId, guess) {
-  // haal kaart uit hand
-  if (!player.hand?.length || cardIdx == null || cardIdx < 0 || cardIdx >= player.hand.length) {
+  if (!player.hand?.length || cardIdx == null || cardIdx < 0 || cardIdx >= player.hand.length)
     return { ok: false, error: 'ongeldige kaart' };
-  }
 
   const card = player.hand.splice(cardIdx, 1)[0];
   room.discard.push(card);
+  const target = targetId ? room.players.get(targetId) : null;
 
-  // target ophalen (mag null zijn als niemand beschikbaar)
-  const target =
-    targetId ? room.players.get(targetId) : null;
-
-  // speciale regels
   if (card.key === 'prinses') {
-    // afleggen = verliezen
     player.alive = false;
     log(room, `${player.name} legt de Prinses af en ligt eruit`);
     removeFromOrder(room, player.id);
   } else if (card.key === 'heks') {
-    // geen directe actie, enkel afleggen
     log(room, `${player.name} legt Heks af`);
   } else if (card.key === 'ziener') {
     if (target && guess) doZiener(room, player, target, guess);
@@ -279,7 +217,7 @@ function playCard(room, player, cardIdx, targetId, guess) {
     if (target) doWolf(room, player, target);
     else log(room, `${player.name} legt Wolf af (geen doelwit)`);
   } else if (card.key === 'ridder') {
-    doRidder(room, player, target); // target optional → self
+    doRidder(room, player, target);
   } else if (card.key === 'zeemeermin') {
     if (target) doZeemeermin(room, player, target);
     else log(room, `${player.name} legt Zeemeermin af (geen doelwit)`);
@@ -290,34 +228,36 @@ function playCard(room, player, cardIdx, targetId, guess) {
     doEmir(room, player, target || player);
   }
 
-  // na actie: check ronde-einde
   if (endRoundIfNeeded(room)) return { ok: true };
-
-  // volgende beurt
   nextTurn(room);
   broadcastState(room);
-  // als bot aan beurt, laat 'm spelen
   maybeBotTurn(room);
   return { ok: true };
 }
 
 /* --------------------------- Socket.io --------------------------- */
-
-function botName(i) {
-  return ['Bot A','Bot B','Bot C','Bot D'][i] || `Bot ${i+1}`;
-}
+function botName(i){ return ['Bot A','Bot B','Bot C','Bot D'][i] || `Bot ${i+1}`; }
 
 io.on('connection', (socket) => {
   socket.on('ping:server', (_p, ack) => ack?.({ ok: true, pong: Date.now() }));
 
   socket.on('join', ({ roomId, name }, ack) => {
     if (!roomId || !name) return ack?.({ ok:false, error:'roomId and name required' });
+
     let room = rooms.get(roomId);
     if (!room) { room = makeRoom(roomId); rooms.set(roomId, room); }
 
     socket.join(roomId);
-    const p = { id: socket.id, name, isHost:false, isBot:false, hand:[], alive:true, protected:false, coins:0 };
-    room.players.set(socket.id, p);
+
+    // ---- DEDUPE: verwijder oude entries (zelfde socket.id of zelfde naam, geen bot)
+    room.players.delete(socket.id);
+    for (const [id, p] of [...room.players]) {
+      if (!p.isBot && p.name === name) room.players.delete(id);
+    }
+
+    // voeg (nieuwe) speler toe
+    const player = { id: socket.id, name, isHost:false, isBot:false, hand:[], alive:true, protected:false, coins:0 };
+    room.players.set(socket.id, player);
 
     log(room, `${name} heeft de kamer betreden`);
     ensureOrder(room);
@@ -327,20 +267,47 @@ io.on('connection', (socket) => {
 
   socket.on('host:claim', (_p, ack) => {
     const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
-    if (room.hostId && room.hostId !== socket.id) return ack?.({ ok:false, error:'host already taken' });
+
+    // als er al een host is (en het is niet jij): weigeren
+    if (room.hostId && room.hostId !== socket.id)
+      return ack?.({ ok:false, error:'host already taken' });
+
+    // markeer (zorg dat player bestaat; bij extreme timing)
+    if (!room.players.has(socket.id)) {
+      room.players.set(socket.id, { id: socket.id, name: 'Host', isHost:true, isBot:false, hand:[], alive:true, protected:false, coins:0 });
+    } else {
+      room.players.get(socket.id).isHost = true;
+    }
     room.hostId = socket.id;
-    const me = room.players.get(socket.id); if (me) me.isHost = true;
-    log(room, `${me?.name ?? 'Host'} is host geworden`);
+
+    ensureOrder(room);
+    log(room, `${room.players.get(socket.id)?.name ?? 'Host'} is host geworden`);
     broadcastState(room);
+    ack?.({ ok:true });
+  });
+
+  socket.on('admin:kick', ({ targetId }, ack) => {
+    const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
+    if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
+    if (!targetId || !room.players.has(targetId)) return ack?.({ ok:false, error:'unknown player' });
+    if (targetId === room.hostId) return ack?.({ ok:false, error:'cannot kick host' });
+
+    const kicked = room.players.get(targetId);
+    room.players.delete(targetId);
+    removeFromOrder(room, targetId);
+    log(room, `${kicked.name} werd gekickt door de host`);
+    broadcastState(room);
+    io.to(targetId).emit('kicked', { roomId: room.roomId });
+    try { io.sockets.sockets.get(targetId)?.leave(room.roomId); } catch {}
     ack?.({ ok:true });
   });
 
   socket.on('bots:configure', ({ botsCount=0, botLevel=1 }, ack) => {
     const room = roomOf(socket); if (!room) return ack?.({ ok:false, error:'no room' });
     if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
-    // verwijder oude bots
+
     for (const [id,p] of [...room.players]) if (p.isBot) room.players.delete(id);
-    // voeg nieuwe toe (max 3)
+
     const n = Math.max(0, Math.min(3, botsCount));
     for (let i=0;i<n;i++){
       const id = `bot-${i+1}-${room.roomId}`;
@@ -371,9 +338,7 @@ io.on('connection', (socket) => {
     if (socket.id !== room.hostId) return ack?.({ ok:false, error:'only host' });
 
     room.started=false; room.round=0; room.turn=null; room.deck=[]; room.discard=[];
-    for (const p of room.players.values()) {
-      p.hand=[]; p.alive=true; p.protected=false;
-    }
+    for (const p of room.players.values()) { p.hand=[]; p.alive=true; p.protected=false; }
     log(room, 'Nieuw spel klaarzetten');
     ensureOrder(room);
     broadcastState(room);
@@ -392,20 +357,14 @@ io.on('connection', (socket) => {
     room.deck = buildDeck();
     room.discard = [];
     for (const p of living) { p.hand=[]; p.protected=false; }
-    // deel 1 kaart
-    for (const p of living) {
-      const c = room.deck.pop(); if (c) p.hand.push(c);
-    }
+    for (const p of living) { const c = room.deck.pop(); if (c) p.hand.push(c); }
     ensureOrder(room);
-    // beginbeurt: bescherming van startspeler uit (fail-safe)
     const turnP = room.players.get(room.turn);
     if (turnP) turnP.protected = false;
 
     log(room, `Ronde ${room.round} gestart`);
     broadcastState(room);
     ack?.({ ok:true });
-
-    // als bot begint
     maybeBotTurn(room);
   });
 
@@ -423,20 +382,14 @@ io.on('connection', (socket) => {
     me.hand.push(card);
     log(room, `${me.name} trekt een kaart`);
 
-    // geforceerde combo check (Heks + Prinses)
     const knocked = enforceForcedCombos(room, me);
     broadcastState(room);
 
     if (knocked) {
-      // speler ligt eruit → mogelijk ronde-einde
       if (endRoundIfNeeded(room)) return ack?.({ ok:true });
-      // anders volgende beurt
-      nextTurn(room);
-      broadcastState(room);
-      maybeBotTurn(room);
+      nextTurn(room); broadcastState(room); maybeBotTurn(room);
       return ack?.({ ok:true });
     }
-
     ack?.({ ok:true, handSize: me.hand.length });
   });
 
@@ -448,23 +401,17 @@ io.on('connection', (socket) => {
     const me = room.players.get(socket.id);
     if (!me) return ack?.({ ok:false, error:'no player' });
 
-    // als kaart target zou vereisen, maar er is niemand beschikbaar EN er is geen targetId verstuurd:
-    // ⇒ we laten het toe als "alleen afleggen".
+    // target-check: alleen echt verplicht als er DOELWITTEN beschikbaar zijn
     const needsTarget = (() => {
       if (cardIdx == null || !me.hand || !me.hand[cardIdx]) return false;
       return NEEDS_TARGET.has(me.hand[cardIdx].key);
     })();
-
     if (needsTarget) {
       const avail = targetsAvailable(room, me.id);
-      if (avail.length > 0 && !targetId) {
-        return ack?.({ ok:false, error:'target required' });
-      }
+      if (avail.length > 0 && !targetId) return ack?.({ ok:false, error:'target required' });
       if (targetId) {
         const t = room.players.get(targetId);
-        if (!t || t.alive === false || t.protected) {
-          return ack?.({ ok:false, error:'invalid target' });
-        }
+        if (!t || t.alive === false || t.protected) return ack?.({ ok:false, error:'invalid target' });
       }
     }
 
@@ -487,18 +434,14 @@ io.on('connection', (socket) => {
 });
 
 /* --------------------------- Bots --------------------------- */
-
 function maybeBotTurn(room) {
   const actor = room.players.get(room.turn);
   if (!actor || !actor.isBot || !room.started) return;
 
-  // simpele "AI"
   setTimeout(() => {
-    // 1) Draw indien nodig
     if ((actor.hand?.length ?? 0) === 1 && room.deck.length) {
       actor.hand.push(room.deck.pop());
       log(room, `${actor.name} trekt een kaart (bot)`);
-      // forced combo check
       const knocked = enforceForcedCombos(room, actor);
       broadcastState(room);
       if (knocked) {
@@ -507,45 +450,34 @@ function maybeBotTurn(room) {
         return maybeBotTurn(room);
       }
     }
-
-    // 2) Kies kaart
     if (!actor.hand?.length) { nextTurn(room); broadcastState(room); return maybeBotTurn(room); }
-    // heel simpel: speel de lagere rank (behalve Heks-regel doet niets, Prinses = fail)
+
     let idx = 0;
     if (actor.hand.length === 2) {
       const [a,b] = actor.hand;
       idx = (a.rank <= b.rank) ? 0 : 1;
-      // probeer Prinses te vermijden
       if (actor.hand[idx].key === 'prinses') idx = 1 - idx;
     }
-
     const card = actor.hand[idx];
-    // 3) Kies doelwit indien nodig
+
     let targetId = null;
     if (NEEDS_TARGET.has(card.key)) {
       const avail = targetsAvailable(room, actor.id);
       if (avail.length > 0) {
-        // kies willekeurig doelwit
         const pick = avail[Math.floor(Math.random()*avail.length)];
         targetId = pick.id;
       }
     }
-
-    // 4) Guess voor Ziener
     let guess = null;
     if (card.key === 'ziener') {
-      // simpele gok: kies willekeurige kaartnaam behalve 'ziener' (vaak)
       const pool = CARD_DEFS.map(c => c.key);
       guess = pool[Math.floor(Math.random()*pool.length)];
     }
-
-    // 5) Speel via dezelfde engine als mensen
     playCard(room, actor, idx, targetId, guess);
   }, 700);
 }
 
 /* ---------------------------------------------------------------- */
-
 server.listen(PORT, () => {
   console.log(`Server luistert op poort ${PORT}`);
 });
