@@ -211,38 +211,119 @@ io.on('connection', (socket) => {
   });
 
   /* ---- speel kaart (jouw bestaande logica blijft hier) ---- */
-  socket.on('game:play', (payload, ack) => {
-    const roomId = socketToRoom.get(socket.id); const room = rooms.get(roomId);
-    if (!room) return ack?.({ ok:false, error:'no room' });
-    const me = room.players.get(socket.id);
-    if (!room.started) return ack?.({ ok:false, error:'round not started' });
-    if (room.turn !== socket.id) return ack?.({ ok:false, error:'not your turn' });
-    if (!me || !Array.isArray(me.hand) || me.hand.length !== 2) return ack?.({ ok:false, error:'need 2 cards in hand' });
+ socket.on('game:play', (payload, ack) => {
+  const roomId = socketToRoom.get(socket.id); const room = rooms.get(roomId);
+  if (!room) return ack?.({ ok:false, error:'no room' });
+  const me = room.players.get(socket.id);
+  if (!room.started) return ack?.({ ok:false, error:'round not started' });
+  if (room.turn !== socket.id) return ack?.({ ok:false, error:'not your turn' });
+  if (!me || !Array.isArray(me.hand) || me.hand.length !== 2) return ack?.({ ok:false, error:'need 2 cards in hand' });
 
-    const { index, targetId, guess } = payload || {};
-    if (index !== 0 && index !== 1) return ack?.({ ok:false, error:'invalid index' });
-    const card = me.hand[index];
-    if (!card) return ack?.({ ok:false, error:'card not in hand' });
+  const { index, targetId, guess, allowNoTarget } = payload || {};
+  if (index !== 0 && index !== 1) return ack?.({ ok:false, error:'invalid index' });
 
-    // --- regels (beknopt, jouw bestaande acties) ---
-    const target = targetId ? room.players.get(targetId) : null;
+  const card = me.hand[index];
+  if (!card) return ack?.({ ok:false, error:'card not in hand' });
+  const other = me.hand[1 - index];
 
-    // speciale case: Heks + Prinses tegelijk => speler *moet* Prinses afleggen en verliest
-    const other = me.hand[1 - index];
-    if (card.key === 'heks' && other?.key === 'prinses') {
-      // Prinses gaat naar discard en speler ligt eruit
-      const princessIdx = me.hand.findIndex(c => c.key === 'prinses');
-      const princess = me.hand.splice(princessIdx, 1)[0];
-      room.discard.push(princess);
-      me.alive = false;
-      log(room, `${me.name} moest de Prinses afleggen en ligt uit het spel!`);
-      // verwijder gespeelde Heks ook
-      const played = me.hand.splice(0,1)[0]; // overgebleven kaart na splice is de Heks
-      room.discard.push(played);
-      nextTurn(room); broadcastState(room); ack?.({ ok:true });
-      maybeBotTurn(room);
-      return;
+  // special: Heks + Prinses => Prinses MOET af en speler verliest
+  if (card.key === 'heks' && other?.key === 'prinses') {
+    const princessIdx = me.hand.findIndex(c => c.key === 'prinses');
+    const princess = me.hand.splice(princessIdx, 1)[0];
+    room.discard.push(princess);
+    me.alive = false;
+    log(room, `${me.name} moest de Prinses afleggen en ligt uit het spel!`);
+    const played = me.hand.splice(0,1)[0]; // heks zelf uit de hand
+    room.discard.push(played);
+    nextTurn(room); broadcastState(room); ack?.({ ok:true });
+    maybeBotTurn(room);
+    return;
+  }
+
+  const needsTarget = ['ziener','wolf','ridder','zeemeermin','god','emir'].includes(card.key);
+  const target = targetId ? room.players.get(targetId) : null;
+
+  // Als doelwit vereist is maar er is geen geldig doelwit: toegestaan om zonder effect af te leggen
+  if (needsTarget) {
+    // Voor 'ridder' mag je iedereen kiezen (ook beschermd, ook jezelf).
+    const ridder = card.key === 'ridder';
+    const validTarget =
+      ridder
+        ? (target && target.alive)
+        : (target && target.alive && !target.protected && (card.key !== 'god' ? true : target.id !== socket.id));
+
+    if (!validTarget) {
+      if (allowNoTarget && card.key !== 'prinses') {
+        const played = me.hand.splice(index, 1)[0];
+        room.discard.push(played);
+        log(room, `${me.name} kon geen geldig doelwit kiezen (${card.name}) — kaart zonder effect`);
+        nextTurn(room); broadcastState(room); ack?.({ ok:true, noTarget:true });
+        maybeBotTurn(room);
+        return;
+      }
+      return ack?.({ ok:false, error:'target required' });
     }
+  }
+
+  // --------- bestaande effect-afhandeling hieronder (ongewijzigd) ----------
+  if (card.key === 'ziener') {
+    if (!guess || guess < 1 || guess > 8) return ack?.({ ok:false, error:'guess required' });
+    const tCard = target.hand?.[0];
+    if (tCard && tCard.rank === Number(guess)) {
+      target.alive = false;
+      log(room, `${me.name} gokte juist (${tCard.name}) — ${target.name} ligt eruit!`);
+    } else {
+      log(room, `${me.name} gokte fout op ${target.name}`);
+    }
+  }
+  else if (card.key === 'wolf') {
+    const tCard = target.hand?.[0];
+    io.to(socket.id).emit('secret:peek', { id: target.id, name: target.name, card: tCard || null });
+    log(room, `${me.name} loert stiekem naar ${target.name}`);
+  }
+  else if (card.key === 'ridder') {
+    target.protected = true;
+    log(room, `${me.name} geeft bescherming aan ${target.name}`);
+  }
+  else if (card.key === 'zeemeermin') {
+    const mine = other; const theirs = target.hand?.[0];
+    if (mine && theirs) {
+      if (mine.rank > theirs.rank) { target.alive = false; log(room, `${me.name} wint (Zeemeermin) — ${target.name} ligt eruit!`); }
+      else if (theirs.rank > mine.rank) { me.alive = false; log(room, `${target.name} wint (Zeemeermin) — ${me.name} ligt eruit!`); }
+      else { log(room, `${me.name} en ${target.name} spelen gelijk (Zeemeermin)`); }
+    }
+  }
+  else if (card.key === 'god') {
+    if (target.id === socket.id) return ack?.({ ok:false, error:'valid target required' });
+    const mine = other; const theirs = target.hand?.[0];
+    if (mine && theirs) {
+      target.hand = [mine];
+      me.hand = [theirs];
+      log(room, `${me.name} wisselt kaart met ${target.name}`);
+    }
+  }
+  else if (card.key === 'emir') {
+    const newCard = room.deck.pop();
+    if (newCard) {
+      if (!target.hand) target.hand = [];
+      target.hand[0] = newCard;
+      log(room, `${target.name} krijgt een nieuwe kaart (Emir)`);
+    }
+  }
+  else if (card.key === 'heks') {
+    log(room, `${me.name} speelt Heks`);
+  }
+  else if (card.key === 'prinses') {
+    return ack?.({ ok:false, error:'Prinses mag niet vrijwillig gespeeld worden' });
+  }
+
+  const played = me.hand.splice(index, 1)[0];
+  room.discard.push(played);
+
+  nextTurn(room); broadcastState(room); ack?.({ ok:true });
+  maybeBotTurn(room);
+});
+
 
     // voorbeeld-acties
     if (card.key === 'ziener') {
